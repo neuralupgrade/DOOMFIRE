@@ -92,8 +92,17 @@ var g_tty_win: win32.HANDLE = undefined;
 
 //// consts, vars, settings
 var rand: std.Random = undefined;
+var g_shutdown: bool = false;
+var g_pending_key: ?u8 = null; // one-slot buffer so sleepMs doesn't steal reads from pause/fire loop
 
 //// functions
+
+extern "c" fn tcflush(fd: std.c.fd_t, queue_selector: c_int) c_int;
+
+fn sigintHandler(sig: std.c.SIG) callconv(.c) void {
+    _ = sig;
+    g_shutdown = true;
+}
 
 fn milliTimestamp() i64 {
     var ts: std.c.timespec = undefined;
@@ -102,9 +111,21 @@ fn milliTimestamp() i64 {
 }
 
 fn sleepMs(ms: u64) void {
-    const ns = ms * std.time.ns_per_ms;
-    const ts = std.c.timespec{ .sec = @intCast(ns / std.time.ns_per_s), .nsec = @intCast(ns % std.time.ns_per_s) };
-    _ = std.c.nanosleep(&ts, null);
+    var remaining = ms;
+    while (remaining > 0 and !g_shutdown) {
+        const step: u64 = @min(remaining, @as(u64, 16));
+        const ns = step * std.time.ns_per_ms;
+        const ts = std.c.timespec{ .sec = @intCast(ns / std.time.ns_per_s), .nsec = @intCast(ns % std.time.ns_per_s) };
+        _ = std.c.nanosleep(&ts, null);
+        remaining -= step;
+        if (builtin.os.tag != .windows and g_pending_key == null) {
+            var key_buf: [1]u8 = undefined;
+            if (std.c.read(stdin_fd, &key_buf, 1) == 1) {
+                g_pending_key = key_buf[0];
+                if (key_buf[0] == 'q') g_shutdown = true;
+            }
+        }
+    }
 }
 
 pub fn initRNG() void {
@@ -332,7 +353,6 @@ pub fn complete() !void {
     //todo -- free colors
     //todo if win, completeWin() -> restore code page
     try emit(term_off);
-    try emit("Complete!" ++ nl);
 }
 
 /////////////////
@@ -340,20 +360,23 @@ pub fn complete() !void {
 /////////////////
 
 pub fn pause() !void {
-    //todo - poll / read a keystroke w/out echo, \n etc
-
+    if (g_shutdown) return;
     try emit(color_reset);
-    try emit("Press return to continue...");
+    try emit("Press any key to continue, q to quit...");
     var b: u8 = undefined;
-    var b_buf: [1]u8 = undefined;
-    _ = std.posix.read(stdin_fd, &b_buf) catch {};
-    b = b_buf[0];
-
-    if (b == 'q') {
-        //exit cleanly
-        try complete();
-        std.process.exit(0);
+    if (g_pending_key) |k| {
+        b = k;
+        g_pending_key = null;
+    } else {
+        var b_buf: [1]u8 = undefined;
+        while (!g_shutdown and std.c.read(stdin_fd, &b_buf, 1) != 1) {
+            const ts = std.c.timespec{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
+            _ = std.c.nanosleep(&ts, null);
+        }
+        if (g_shutdown) return;
+        b = b_buf[0];
     }
+    if (b == 'q') g_shutdown = true;
 }
 
 /// Part I - Terminal Size Check
@@ -767,9 +790,7 @@ pub fn showDoomFire() !void {
     try initBuf();
     defer freeBuf();
 
-    //when there is an ez way to poll for key stroke...do that.  for now, ctrl+c!
-    const ok = true;
-    while (ok) {
+    while (!g_shutdown) {
 
         //update fire buf
         doFire_x = 0;
@@ -835,6 +856,17 @@ pub fn showDoomFire() !void {
         }
         try paintBuf();
         resetBuf();
+
+        if (builtin.os.tag != .windows) {
+            const key: u8 = if (g_pending_key) |k| blk: {
+                g_pending_key = null;
+                break :blk k;
+            } else blk: {
+                var key_buf: [1]u8 = undefined;
+                break :blk if (std.c.read(stdin_fd, &key_buf, 1) == 1) key_buf[0] else 0;
+            };
+            if (key == 'q') break;
+        }
     }
 }
 
@@ -846,12 +878,35 @@ pub fn main() anyerror!void {
     stdout_fd = std.Io.File.stdout().handle;
     stdin_fd = std.Io.File.stdin().handle;
 
+    if (builtin.os.tag != .windows) {
+        std.posix.sigaction(.INT, &.{
+            .handler = .{ .handler = sigintHandler },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        }, null);
+    }
+
+    var orig_termios: std.c.termios = undefined;
+    if (builtin.os.tag != .windows) {
+        _ = std.c.tcgetattr(stdin_fd, &orig_termios);
+        var raw = orig_termios;
+        raw.lflag.ICANON = false;
+        raw.lflag.ECHO = false;
+        raw.cc[16] = 0; // VMIN=0
+        raw.cc[17] = 0; // VTIME=0
+        _ = std.c.tcsetattr(stdin_fd, std.c.TCSA.NOW, &raw);
+    }
+    defer if (builtin.os.tag != .windows) {
+        _ = tcflush(stdin_fd, 1); // TCIFLUSH
+        _ = std.c.tcsetattr(stdin_fd, std.c.TCSA.NOW, &orig_termios);
+    };
+
     try initTerm();
     defer complete() catch {};
 
     try checkTermSz();
-    try showTermCap();
-    try showDoomFire();
+    if (!g_shutdown) try showTermCap();
+    if (!g_shutdown) try showDoomFire();
 }
 
 // -- NOTE -- Keep the below aligned w/Microsoft Windows (MS WIN) specification
